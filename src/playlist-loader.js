@@ -94,6 +94,10 @@
 
       PlaylistLoader.prototype.init.call(this);
 
+      // a flag that disables "expired time"-tracking this setting has
+      // no effect when not playing a live stream
+      this.trackExpiredTime_ = false;
+
       if (!srcUrl) {
         throw new Error('A non-empty playlist URL is required');
       }
@@ -151,6 +155,11 @@
 
       // initialize the loader state
       loader.state = 'HAVE_NOTHING';
+
+      // track the time that has expired from the live window
+      // this allows the seekable start range to be calculated even if
+      // all segments with timing information have expired
+      this.expired_ = 0;
 
       // capture the prototype dispose function
       dispose = this.dispose;
@@ -262,6 +271,12 @@
         loader.bandwidth = xhr.bandwidth;
       };
 
+      // In a live list, don't keep track of the expired time until
+      // HLS tells us that "first play" has commenced
+      loader.on('firstplay', function() {
+        this.trackExpiredTime_ = true;
+      });
+
       // live playlist staleness timeout
       loader.on('mediaupdatetimeout', function() {
         if (loader.state !== 'HAVE_METADATA') {
@@ -346,7 +361,64 @@
    * @param update {object} the updated media playlist object
    */
   PlaylistLoader.prototype.updateMediaPlaylist_ = function(update) {
+    var outdated, i, segment;
+
+    outdated = this.media_;
     this.media_ = this.master.playlists[update.uri];
+
+    if (!outdated) {
+      return;
+    }
+
+    // don't track expired time until this flag is truthy
+    if (!this.trackExpiredTime_) {
+      return;
+    }
+
+    // if the update was the result of a rendition switch do not
+    // attempt to calculate expired_ since media-sequences need not
+    // correlate between renditions/variants
+    if (update.uri !== outdated.uri) {
+      return;
+    }
+
+    // try using precise timing from first segment of the updated
+    // playlist
+    if (update.segments.length) {
+      if (update.segments[0].start !== undefined) {
+        this.expired_ = update.segments[0].start;
+        return;
+      } else if (update.segments[0].end !== undefined) {
+        this.expired_ = update.segments[0].end - update.segments[0].duration;
+        return;
+      }
+    }
+
+    // calculate expired by walking the outdated playlist
+    i = update.mediaSequence - outdated.mediaSequence - 1;
+
+    for (; i >= 0; i--) {
+      segment = outdated.segments[i];
+
+      if (!segment) {
+        // we missed information on this segment completely between
+        // playlist updates so we'll have to take an educated guess
+        // once we begin buffering again, any error we introduce can
+        // be corrected
+        this.expired_ += outdated.targetDuration || 10;
+        continue;
+      }
+
+      if (segment.end !== undefined) {
+        this.expired_ = segment.end;
+        return;
+      }
+      if (segment.start !== undefined) {
+        this.expired_ = segment.start + segment.duration;
+        return;
+      }
+      this.expired_ += segment.duration;
+    }
   };
 
   /**
@@ -372,7 +444,6 @@
       i,
       segment,
       originalTime = time,
-      targetDuration = this.media_.targetDuration || 10,
       numSegments = this.media_.segments.length,
       lastSegment = numSegments - 1,
       startIndex,
@@ -392,73 +463,39 @@
 
     // find segments with known timing information that bound the
     // target time
-
-    // Walk backward until we find the first segment with timeline
-    // information that is earlier than `time`
-    for (i = lastSegment; i >= 0; i--) {
-      segment = this.media_.segments[i];
-      if (segment.end !== undefined && segment.end <= time) {
-        startIndex = i + 1;
-        knownStart = segment.end;
-        if (startIndex >= numSegments) {
-          // The last segment claims to end *before* the time we are
-          // searching for so just return it
-          return numSegments;
-        }
-        break;
-      }
-      if (segment.start !== undefined && segment.start <= time) {
-        if (segment.end !== undefined && segment.end > time) {
-          // we've found the target segment exactly
-          return i;
-        }
-        startIndex = i;
-        knownStart = segment.start;
-        break;
-      }
-    }
-
-    // Walk forward until we find the first segment with timeline
-    // information that is greater than `time`
     for (i = 0; i < numSegments; i++) {
       segment = this.media_.segments[i];
-      if (segment.start !== undefined && segment.start > time) {
-        endIndex = i - 1;
-        knownEnd = segment.start;
-        if (endIndex < 0) {
-          // The first segment claims to start *after* the time we are
-          // searching for so the target segment must no longer be
-          // available
-          return -1;
+      if (segment.end) {
+        if (segment.end > time) {
+          knownEnd = segment.end;
+          endIndex = i;
+          break;
+        } else {
+          knownStart = segment.end;
+          startIndex = i + 1;
         }
-        break;
-      }
-      if (segment.end !== undefined && segment.end > time) {
-        endIndex = i;
-        knownEnd = segment.end;
-        break;
       }
     }
 
     // use the bounds we just found and playlist information to
     // estimate the segment that contains the time we are looking for
-
     if (startIndex !== undefined) {
       // We have a known-start point that is before our desired time so
       // walk from that point forwards
       time = time - knownStart;
       for (i = startIndex; i < (endIndex || numSegments); i++) {
         segment = this.media_.segments[i];
-        time -= segment.duration || targetDuration;
+        time -= segment.duration;
+
         if (time < 0) {
           return i;
         }
       }
 
-      if (i === endIndex) {
+      if (i >= endIndex) {
         // We haven't found a segment but we did hit a known end point
-        // so fallback to "Algorithm Jon" - try to interpolate the segment
-        // index based on the known span of the timeline we are dealing with
+        // so fallback to interpolating between the segment index
+        // based on the known span of the timeline we are dealing with
         // and the number of segments inside that span
         return startIndex + Math.floor(
           ((originalTime - knownStart) / (knownEnd - knownStart)) *
@@ -473,20 +510,32 @@
       time = knownEnd - time;
       for (i = endIndex; i >= 0; i--) {
         segment = this.media_.segments[i];
-        time -= segment.duration || targetDuration;
+        time -= segment.duration;
+
         if (time < 0) {
           return i;
         }
       }
-      // We haven't found a segment so load the first one
-      return 0;
+
+      // We haven't found a segment so load the first one if time is zero
+      if (time === 0) {
+        return 0;
+      } else {
+        return -1;
+      }
     } else {
-      // We known nothing so use "Algorithm A" - walk from the front
-      // of the playlist naively subtracking durations until we find
-      // a segment that contains time and return it
+      // We known nothing so walk from the front of the playlist,
+      // subtracting durations until we find a segment that contains
+      // time and return it
+      time = time - this.expired_;
+
+      if (time < 0) {
+        return -1;
+      }
+
       for (i = 0; i < numSegments; i++) {
         segment = this.media_.segments[i];
-        time -= segment.duration || targetDuration;
+        time -= segment.duration;
         if (time < 0) {
           return i;
         }

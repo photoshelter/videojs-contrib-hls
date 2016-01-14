@@ -335,6 +335,8 @@ test('autoplay seeks to the live point after playlist load', function() {
     type: 'application/vnd.apple.mpegurl'
   });
   openMediaSource(player);
+  player.tech_.readyState = function(){return 1;};
+  player.tech_.trigger('play');
   standardXHRResponse(requests.shift());
   clock.tick(1);
 
@@ -355,6 +357,8 @@ test('autoplay seeks to the live point after media source open', function() {
   clock.tick(1);
   standardXHRResponse(requests.shift());
   openMediaSource(player);
+  player.tech_.readyState = function(){return 1;};
+  player.tech_.trigger('play');
   clock.tick(1);
 
   notEqual(currentTime, 0, 'seeked on autoplay');
@@ -371,6 +375,82 @@ test('duration is set when the source opens after the playlist is loaded', funct
   openMediaSource(player);
 
   equal(player.tech_.hls.mediaSource.duration , 40, 'set the duration');
+});
+
+test('calls `remove` on sourceBuffer to when loading a live segment', function() {
+  var
+    removes = [],
+    seekable = videojs.createTimeRanges([[60, 120]]);
+
+  player.src({
+    src: 'liveStart30sBefore.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  openMediaSource(player);
+  player.tech_.hls.seekable = function(){
+    return seekable;
+  };
+
+  openMediaSource(player);
+  player.tech_.hls.mediaSource.addSourceBuffer = function() {
+    return new (videojs.extend(videojs.EventTarget, {
+      constructor: function() {},
+      abort: function() {},
+      buffered: videojs.createTimeRange(),
+      appendBuffer: function() {},
+      remove: function(start, end) {
+        removes.push([start, end]);
+      }
+    }))();
+  };
+  player.tech_.hls.bandwidth = 20e10;
+  player.tech_.triggerReady();
+  standardXHRResponse(requests[0]);
+
+  player.tech_.hls.playlists.trigger('loadedmetadata');
+  player.tech_.trigger('canplay');
+  player.tech_.paused = function() { return false; };
+  player.tech_.readyState = function(){return 1;};
+  player.tech_.trigger('play');
+
+  clock.tick(1);
+  standardXHRResponse(requests[1]);
+
+  strictEqual(requests[0].url, 'liveStart30sBefore.m3u8', 'master playlist requested');
+  equal(removes.length, 1, 'remove called');
+  deepEqual(removes[0], [0, seekable.start(0)], 'remove called with the right range');
+});
+
+test('calls `remove` on sourceBuffer to when loading a vod segment', function() {
+  var removes = [];
+  player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  openMediaSource(player);
+  player.tech_.hls.mediaSource.addSourceBuffer = function() {
+    return new (videojs.extend(videojs.EventTarget, {
+      constructor: function() {},
+      abort: function() {},
+      buffered: videojs.createTimeRange(),
+      appendBuffer: function() {},
+      remove: function(start, end) {
+        removes.push([start, end]);
+      }
+    }))();
+  };
+  player.tech_.hls.bandwidth = 20e10;
+  standardXHRResponse(requests[0]);
+  player.currentTime(120);
+  standardXHRResponse(requests[1]);
+  standardXHRResponse(requests[2]);
+
+  strictEqual(requests[0].url, 'manifest/master.m3u8', 'master playlist requested');
+  strictEqual(requests[1].url,
+              absoluteUrl('manifest/media3.m3u8'),
+              'media playlist requested');
+  equal(removes.length, 1, 'remove called');
+  deepEqual(removes[0], [0, 120 - 60], 'remove called with the right range');
 });
 
 test('codecs are passed to the source buffer', function() {
@@ -549,11 +629,11 @@ test('finds the correct buffered region based on currentTime', function() {
   standardXHRResponse(requests[1]);
   player.currentTime(3);
   clock.tick(1);
-  equal(player.tech_.hls.findCurrentBuffered_().end(0),
+  equal(player.tech_.hls.findBufferedRange_().end(0),
         5, 'inside the first buffered region');
   player.currentTime(6);
   clock.tick(1);
-  equal(player.tech_.hls.findCurrentBuffered_().end(0),
+  equal(player.tech_.hls.findBufferedRange_().end(0),
         12, 'inside the second buffered region');
 });
 
@@ -1608,6 +1688,7 @@ test('live playlist starts three target durations before live', function() {
   equal(requests.length, 0, 'no outstanding segment request');
 
   player.tech_.paused = function() { return false; };
+  player.tech_.readyState = function(){return 1;};
   player.tech_.trigger('play');
   clock.tick(1);
   mediaPlaylist = player.tech_.hls.playlists.media();
@@ -1628,12 +1709,48 @@ test('live playlist starts with correct currentTime value', function() {
   player.tech_.hls.playlists.trigger('loadedmetadata');
 
   player.tech_.paused = function() { return false; };
+  player.tech_.readyState = function(){return 1;};
   player.tech_.trigger('play');
   clock.tick(1);
 
   strictEqual(player.currentTime(),
               videojs.Hls.Playlist.seekable(player.tech_.hls.playlists.media()).end(0),
               'currentTime is updated at playback');
+});
+
+test('adjusts the seekable start based on the amount of expired live content', function() {
+  player.src({
+    src: 'http://example.com/manifest/liveStart30sBefore.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  openMediaSource(player);
+
+  standardXHRResponse(requests.shift());
+
+  // add timeline info to the playlist
+  player.tech_.hls.playlists.media().segments[1].end = 29.5;
+  // expired_ should be ignored if there is timeline information on
+  // the playlist
+  player.tech_.hls.playlists.expired_ = 172;
+
+  equal(player.seekable().start(0),
+        29.5 - 29,
+        'offset the seekable start');
+});
+
+test('estimates seekable ranges for live streams that have been paused for a long time', function() {
+  player.src({
+    src: 'http://example.com/manifest/liveStart30sBefore.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  openMediaSource(player);
+
+  standardXHRResponse(requests.shift());
+  player.tech_.hls.playlists.expired_ = 172;
+
+  equal(player.seekable().start(0),
+        player.tech_.hls.playlists.expired_,
+        'offset the seekable start');
 });
 
 test('resets the time to a seekable position when resuming a live stream ' +
@@ -2710,47 +2827,72 @@ test('does not download segments if preload option set to none', function() {
 
 module('Buffer Inspection');
 
-test('detects time range edges added by updates', function() {
-  var edges;
+test('detects time range end-point changed by updates', function() {
+  var edge;
 
-  edges = videojs.Hls.bufferedAdditions_(videojs.createTimeRange([[0, 10]]),
-                                         videojs.createTimeRange([[0, 11]]));
-  deepEqual(edges, [{ end: 11 }], 'detected a forward addition');
+  // Single-range changes
+  edge = videojs.Hls.findSoleUncommonTimeRangesEnd_(videojs.createTimeRange([[0, 10]]),
+                                                    videojs.createTimeRange([[0, 11]]));
+  strictEqual(edge, 11, 'detected a forward addition');
 
-  edges = videojs.Hls.bufferedAdditions_(videojs.createTimeRange([[5, 10]]),
-                                         videojs.createTimeRange([[0, 10]]));
-  deepEqual(edges, [{ start: 0 }], 'detected a backward addition');
+  edge = videojs.Hls.findSoleUncommonTimeRangesEnd_(videojs.createTimeRange([[5, 10]]),
+                                                    videojs.createTimeRange([[0, 10]]));
+  strictEqual(edge, null, 'ignores backward addition');
 
-  edges = videojs.Hls.bufferedAdditions_(videojs.createTimeRange([[5, 10]]),
-                                         videojs.createTimeRange([[0, 11]]));
-  deepEqual(edges, [
-    { start: 0 }, { end: 11 }
-  ], 'detected forward and backward additions');
+  edge = videojs.Hls.findSoleUncommonTimeRangesEnd_(videojs.createTimeRange([[5, 10]]),
+                                                    videojs.createTimeRange([[0, 11]]));
+  strictEqual(edge, 11, 'detected a forward addition & ignores a backward addition');
 
-  edges = videojs.Hls.bufferedAdditions_(videojs.createTimeRange([[0, 10]]),
-                                         videojs.createTimeRange([[0, 10]]));
-  deepEqual(edges, [], 'detected no addition');
+  edge = videojs.Hls.findSoleUncommonTimeRangesEnd_(videojs.createTimeRange([[0, 10]]),
+                                                    videojs.createTimeRange([[0, 9]]));
+  strictEqual(edge, null, 'ignores a backwards addition resulting from a shrinking range');
 
-  edges = videojs.Hls.bufferedAdditions_(videojs.createTimeRange([]),
-                                         videojs.createTimeRange([[0, 10]]));
-  deepEqual(edges, [
-    { start: 0 },
-    { end: 10 }
-  ], 'detected an initial addition');
+  edge = videojs.Hls.findSoleUncommonTimeRangesEnd_(videojs.createTimeRange([[0, 10]]),
+                                                    videojs.createTimeRange([[2, 7]]));
+  strictEqual(edge, null, 'ignores a forward & backwards addition resulting from a shrinking range');
 
-  edges = videojs.Hls.bufferedAdditions_(videojs.createTimeRange([[0, 10]]),
-                                         videojs.createTimeRange([[0, 10], [20, 30]]));
-  deepEqual(edges, [
-    { start: 20 },
-    { end: 30}
-  ], 'detected a non-contiguous addition');
-});
+  edge = videojs.Hls.findSoleUncommonTimeRangesEnd_(videojs.createTimeRange([[2, 10]]),
+                                                    videojs.createTimeRange([[0, 7]]));
+  strictEqual(edge, null, 'ignores a forward & backwards addition resulting from a range shifted backward');
 
-test('treats null buffered ranges as no addition', function() {
-  var edges = videojs.Hls.bufferedAdditions_(null,
-                                             videojs.createTimeRange([[0, 11]]));
+  edge = videojs.Hls.findSoleUncommonTimeRangesEnd_(videojs.createTimeRange([[2, 10]]),
+                                                    videojs.createTimeRange([[5, 15]]));
+  strictEqual(edge, 15, 'detected a forwards addition resulting from a range shifted foward');
 
-  equal(edges.length, 0, 'no additions');
+  // Multiple-range changes
+  edge = videojs.Hls.findSoleUncommonTimeRangesEnd_(videojs.createTimeRange([[0, 10]]),
+                                                    videojs.createTimeRange([[0, 11], [12, 15]]));
+  strictEqual(edge, null, 'ignores multiple new forward additions');
+
+  edge = videojs.Hls.findSoleUncommonTimeRangesEnd_(videojs.createTimeRange([[0, 10], [20, 40]]),
+                                                    videojs.createTimeRange([[20, 50]]));
+  strictEqual(edge, 50, 'detected a forward addition & ignores range removal');
+
+  edge = videojs.Hls.findSoleUncommonTimeRangesEnd_(videojs.createTimeRange([[0, 10], [20, 40]]),
+                                                    videojs.createTimeRange([[0, 50]]));
+  strictEqual(edge, 50, 'detected a forward addition & ignores merges');
+
+  edge = videojs.Hls.findSoleUncommonTimeRangesEnd_(videojs.createTimeRange([[0, 10], [20, 40]]),
+                                                    videojs.createTimeRange([[0, 40]]));
+  strictEqual(edge, null, 'ignores merges');
+
+  // Empty input
+  edge = videojs.Hls.findSoleUncommonTimeRangesEnd_(videojs.createTimeRange(),
+                                                    videojs.createTimeRange([[0, 11]]));
+  strictEqual(edge, 11, 'handle an empty original TimeRanges object');
+
+  edge = videojs.Hls.findSoleUncommonTimeRangesEnd_(videojs.createTimeRange([[0, 11]]),
+                                                    videojs.createTimeRange());
+  strictEqual(edge, null, 'handle an empty update TimeRanges object');
+
+  // Null input
+  edge = videojs.Hls.findSoleUncommonTimeRangesEnd_(null,
+                                                    videojs.createTimeRange([[0, 11]]));
+  strictEqual(edge, 11, 'treat null original buffer as an empty TimeRanges object');
+
+  edge = videojs.Hls.findSoleUncommonTimeRangesEnd_(videojs.createTimeRange([[0, 11]]),
+                                                    null);
+  strictEqual(edge, null, 'treat null update buffer as an empty TimeRanges object');
 });
 
 })(window, window.videojs);
